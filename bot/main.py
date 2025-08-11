@@ -1,16 +1,20 @@
 import asyncio
 import logging
 
+# TODO: СДЕЛАТЬ ДРУГУЮ, ПОТНЯТНУЮ ФАБРИКУ КОЛЛБЭКОВ, ДОБАВИТЬ ФУНКЦИИ ОТЛОЖИТЬ И НАСТРОИТЬ НАПОМИНАНИЕ
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from asyncio.exceptions import CancelledError
 
-from db import *
-from utils import *
+from bot.utils.callbacks import TaskCB
+from bot.utils.fsm_states import AddTask
+from db import *  # Импортируем все операции с БД
+from bot.utils.utils import *  # Импортируем все инструменты
+from reminder import Reminder  # Импортируем класс для напоминаний
+from bot.utils.menu import menu  # Импортируем меню
 
 load_dotenv()
 bt = Bot(token=os.getenv('BOT_TOKEN'))
@@ -18,45 +22,12 @@ dp = Dispatcher()
 cbrouter = Router()
 
 reminder_check_delay = 30
+cancel_fsm_button = InlineKeyboardButton(text='Cancel❌', callback_data='cancel_add')
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-class AddT(StatesGroup):
-    received_name = State()
-    received_desc = State()
-    received_priority = State()
-    received_reminder_dt = State()
-    received_reminder_time = State()
-    received_exc = State()
-
-
-class Reminder:
-    def __init__(self, bot: Bot):
-        self.bot = bot
-
-    async def start_(self, delay: int):
-        logger.info('REMINDER STARTED')
-        while True:
-            r_tasks = await get_remind_tasks()
-
-            for task in r_tasks:
-                if task.get("reminder") == datetime.datetime.now().replace(second=0, microsecond=0):
-                    cb_data = f"upd-status:{task.get("id")}"
-
-                    await self.bot.send_message(task.get("user_id"),
-                                                text=f"Remind you to do {task.get("name")}.",
-                                                reply_markup=InlineKeyboardMarkup(
-                                                    inline_keyboard=[[InlineKeyboardButton(text="Task is ready",
-                                                                                           callback_data=cb_data)]]
-                                                ))
-                    logger.info(f"TASK {task.get('id')} WAS REMINDED")
-                    await upd_sent_reminder(task.get("id"))
-            await asyncio.sleep(delay)
-
 
 @cbrouter.message(Command("reminders"))
 async def view_r(m: Message, edit: bool = False):
@@ -94,23 +65,23 @@ async def add_task(m: Message, state: FSMContext):
     await m.answer('Enter name of the task.',
                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[cancel_fsm_button]]))
 
-    await state.set_state(AddT.received_name)
+    await state.set_state(AddTask.received_name)
     await state.update_data()
 
 
-@cbrouter.message(AddT.received_name)
+@cbrouter.message(AddTask.received_name)
 async def add_desc(m: Message, state: FSMContext):
     await state.update_data({'name': m.text})
-    await state.set_state(AddT.received_desc)
+    await state.set_state(AddTask.received_desc)
 
     await m.answer('Enter description of the task.',
                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[cancel_fsm_button]]))
 
 
-@cbrouter.message(AddT.received_desc)
+@cbrouter.message(AddTask.received_desc)
 async def add_priority(m: Message, state: FSMContext):
     await state.update_data({'desc': m.text})
-    await state.set_state(AddT.received_priority)
+    await state.set_state(AddTask.received_priority)
 
     await m.answer(text='Enter priority (tasks with priority show first).',
                    reply_markup=InlineKeyboardMarkup(
@@ -126,7 +97,7 @@ async def add_priority(m: Message, state: FSMContext):
                    )
 
 
-@cbrouter.callback_query(AddT.received_priority, F.data.contains('priority'))
+@cbrouter.callback_query(AddTask.received_priority, F.data.contains('priority'))
 async def add_reminder(c: CallbackQuery | Message, state: FSMContext, is_pr: bool = None):
     sample = ("Enter the date if you want to receive notifications.\n"
               "Date should be <i>day.month</i> (ex. 01.06)")
@@ -150,13 +121,13 @@ async def add_reminder(c: CallbackQuery | Message, state: FSMContext, is_pr: boo
     if is_pr:  # with priority
         await state.update_data({'priority': is_pr})
         await mess.answer(text=sample, reply_markup=mk, parse_mode="HTML")
-        await state.set_state(AddT.received_reminder_dt)
+        await state.set_state(AddTask.received_reminder_dt)
     else:  # with no priority
         await mess.answer(text=sample, reply_markup=mk, parse_mode="HTML")
-        await state.set_state(AddT.received_reminder_dt)
+        await state.set_state(AddTask.received_reminder_dt)
 
 
-@cbrouter.callback_query(AddT.received_reminder_dt, F.data.contains('today') | F.data.contains('tomorrow'))
+@cbrouter.callback_query(AddTask.received_reminder_dt, F.data.contains('today') | F.data.contains('tomorrow'))
 async def user_ex_rem_date(c: CallbackQuery, state: FSMContext):
     match c.data.split('-')[-1]:
         case 'today':
@@ -167,7 +138,7 @@ async def user_ex_rem_date(c: CallbackQuery, state: FSMContext):
             await user_rem_date(c.message, state, datetime.datetime.strptime(f"{date.day}.{date.month}", "%d.%m"))
 
 
-@cbrouter.message(AddT.received_reminder_dt)
+@cbrouter.message(AddTask.received_reminder_dt)
 async def user_rem_date(c: Message, state: FSMContext, date=None):
     try:
         if not date:
@@ -175,17 +146,17 @@ async def user_rem_date(c: Message, state: FSMContext, date=None):
 
         await state.update_data({'reminder': handle_date(date)})
 
-        await state.set_state(AddT.received_reminder_time)
+        await state.set_state(AddTask.received_reminder_time)
         await c.answer(text='Enter reminder time.\n'
                             'Time should be hours:minutes (ex. 15:30)')
     except ValueError:
         await c.answer('Invalid date or format.\nTry again.')
-        await state.set_state(AddT.received_reminder_dt)
+        await state.set_state(AddTask.received_reminder_dt)
     except Exception as e:
         logger.error(e)
 
 
-@cbrouter.message(AddT.received_reminder_time)
+@cbrouter.message(AddTask.received_reminder_time)
 async def finish_creation(c: Message, state: FSMContext):
     try:
         tm = datetime.datetime.strptime(f"{await state.get_value('reminder')} {c.text.strip()}",
@@ -205,12 +176,12 @@ async def finish_creation(c: Message, state: FSMContext):
             await add_reminder(c, state, await state.get_value("priority"))
     except ValueError:
         await c.answer('Invalid time or format.\nTry again.')
-        await state.set_state(AddT.received_reminder_time)
+        await state.set_state(AddTask.received_reminder_time)
     except Exception as e:
         logger.error(e)
 
 
-@cbrouter.callback_query(F.data.endswith('rem-0'), AddT.received_reminder_dt)
+@cbrouter.callback_query(F.data.endswith('rem-0'), AddTask.received_reminder_dt)
 async def finish_with_no_reminder(c: CallbackQuery, state: FSMContext):
     try:
         await cr_task(user_id=c.from_user.id, **await state.get_data())
@@ -301,7 +272,6 @@ async def del_task(c: CallbackQuery):
     except Exception as e:
         logger.warning(e)
 
-
 @cbrouter.callback_query(F.data.startswith("upd-status"))
 async def ready_task(c: CallbackQuery):
     try:
@@ -328,16 +298,13 @@ async def any_message(m: Message, state: FSMContext):
         await m.reply('Invalid command. Type / to see menu.')
 
 async def start_reminder():
-    await Reminder(bt).start_(reminder_check_delay)
+    await Reminder(bt, logger).start_(reminder_check_delay)
 
 async def start_bt():
     dp.include_router(cbrouter)
     await bt.set_my_commands(menu)
 
-    try:
-        await dp.start_polling(bt)
-    except CancelledError:
-        pass
+    await dp.start_polling(bt)
 
 
 async def main():
